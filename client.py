@@ -1,33 +1,211 @@
+# ==========================================
+# client.py
+# Unified multi-threaded TCP & UDP Client
+# ==========================================
 import socket
 import threading
+import config
+import helpers
+import os
+import time
 
-port = 58000
-host = '127.0.0.1'
+# Tracks P2P file transfer states
+pending_target = None
+pending_file = None
 
-alias = input('Choose an alias: ')
-client = socket.socket(socket.AF_INET, socket.SOCK_STREAM) #creating a socket object that will be used to connect to the server, we are using the AF_INET address family and the SOCK_STREAM socket type, which means we are using TCP protocol for communication
-client.connect((host, port))#sending a connection request to the server, we are using the connect method of the socket object and passing the host and port as arguments
-
-def receive():
+# ==========================================
+# SECTION 1: UDP P2P MEDIA TRANSFER
+# ==========================================
+def listen_for_udp_files(udp_socket):
+    """
+    Runs in a background thread. Constantly listens on the dynamic UDP port 
+    for incoming P2P file transfers from other clients.
+    """
+    file_open = False
+    f = None
     while True:
         try:
-            message = client.recv(1024).decode('utf-8') #receiving messages from the server, we are using the recv method of the socket object and passing the buffer size as an argument, we are also decoding the message from bytes to string using the decode method
-            if message == 'alias?': #if the message from the server is 'alias?' then we send the alias of the client to the server
-                client.send(alias.encode('utf-8'))
+            data, addr = udp_socket.recvfrom(4096)
+            if data == b"EOF":
+                if f:
+                    f.close()
+                    file_open = False
+                print("\n[P2P SYSTEM]: Incoming media transfer complete! Saved as 'p2p_received_media.mp4'")
+                print(" > ", end="", flush=True) # Reset UI prompt
             else:
-                print(message) #if the message is not 'alias?' then we print the message to the console
-        except:
-            print('An error occurred!') #if there is an error while receiving messages from the server, we print an error message to the console
-            client.close() #closing the connection to the server
+                # Open the file container on the first packet received
+                if not file_open:
+                    f = open("p2p_received_media.mp4", "wb")
+                    file_open = True
+                f.write(data)
+        except Exception:
             break
 
-def client_send():
+def send_file_udp_task(target_ip, target_port, filepath):
+    """
+    Spawns temporarily to blast a file over connectionless UDP.
+    Auto-generates dummy files if the requested file doesn't exist to allow easy testing.
+    """
+    if not os.path.exists(filepath):
+        print(f"\n[SYSTEM] Auto-generating 5MB dummy file '{filepath}' for transfer test...")
+        with open(filepath, 'wb') as dummy:
+            dummy.write(os.urandom(5 * 1024 * 1024)) 
+
+    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    print(f"\n[P2P SYSTEM]: Blasting '{filepath}' to {target_ip}:{target_port} via UDP...")
+    
+    start_time = time.time()
+    with open(filepath, 'rb') as file:
+        while True:
+            chunk = file.read(4096) # Standard safe UDP packet size
+            if not chunk: 
+                break
+            udp_socket.sendto(chunk, (target_ip, target_port))
+            time.sleep(0.001) # Prevent local buffer overflow
+            
+    # Send the End Of File flag so the receiver knows to stop listening
+    udp_socket.sendto(b"EOF", (target_ip, target_port))
+    end_time = time.time()
+    
+    print(f"\n[P2P SYSTEM]: Transfer finished in {round(end_time - start_time, 4)} seconds!")
+    print(" > ", end="", flush=True)
+    udp_socket.close()
+
+# ==========================================
+# SECTION 2: TCP CLIENT & UI INTERFACE
+# ==========================================
+def receive_tcp_messages(sock):
+    """
+    Runs in a background thread. Listens for server broadcasts, 
+    private messages, and directory lookup responses.
+    """
+    global pending_target, pending_file
     while True:
-        message = f'{alias}: {input("")}' #getting the message from the user and adding the alias of the client to the message
-        client.send(message.encode('utf-8')) #sending the message to the server, we are using the send method of the socket object and passing the message as an argument, we are also encoding the message from string to bytes using the encode method
+        try:
+            raw_bytes = sock.recv(config.BUFFER_SIZE)
+            if not raw_bytes: 
+                break
+                
+            headers, body = helpers.parse_message(helpers.decode_message(raw_bytes))
+            
+            # --- SCENARIO A: Text Message Display ---
+            if headers.get("MessageType") == "DATA" and headers.get("Command") == "TEXT":
+                sender = headers.get("SenderID")
+                recipient = headers.get("RecipientID")
+                
+                if recipient == "GROUP":
+                    print(f"\n[{sender} to GROUP]: {body}")
+                else:
+                    print(f"\n[PRIVATE from {sender}]: {body}")
+                print(" > ", end="", flush=True) 
+                
+            # --- SCENARIO B: P2P Directory Lookup Response ---
+            elif headers.get("MessageType") == "CONTROL" and headers.get("Command") == "PEER_INFO":
+                ip_and_port = body
+                target_ip = ip_and_port.split(":")[0]
+                target_port = int(ip_and_port.split(":")[1])
+                
+                # If we initiated a /sendfile command, trigger the UDP thread now!
+                if pending_file:
+                    threading.Thread(target=send_file_udp_task, args=(target_ip, target_port, pending_file), daemon=True).start()
+                    pending_file = None 
+                    pending_target = None
+                else:
+                    # Otherwise, it was just a manual /lookup command
+                    print(f"\n[SERVER DIRECTORY]: Peer is at {ip_and_port}")
+                    print(" > ", end="", flush=True)
+                    
+            # --- SCENARIO C: Server Errors ---
+            elif headers.get("MessageType") == "CONTROL" and headers.get("Command") == "ERROR":
+                print(f"\n[SERVER ERROR]: {body}")
+                print(" > ", end="", flush=True)
+                pending_file = None 
+                
+        except Exception:
+            break
 
-receive_thread = threading.Thread(target=receive) #creating a thread for receiving messages from the server, we are using the Thread class from the threading module and passing the receive function as the target
-receive_thread.start() #starting the thread for receiving messages from the server
+def start_protocol_client():
+    """Initializes sockets, handles login, and runs the main user input loop."""
+    global pending_target, pending_file
+    
+    # 1. Bind the UDP socket to a random dynamic port for receiving files
+    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_socket.bind(('0.0.0.0', 0)) 
+    my_udp_port = udp_socket.getsockname()[1]
+    
+    # Start the UDP listener in the background
+    threading.Thread(target=listen_for_udp_files, args=(udp_socket,), daemon=True).start()
+    
+    # 2. Establish the primary TCP connection to the Central Server
+    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        print("--- Chat Client Startup ---")
+        target_server_ip = input("Enter Server IP (Press Enter for Localhost): ").strip()
+        if target_server_ip == "":
+            target_server_ip = '127.0.0.1'
+            
+        print(f"[*] Connecting to {target_server_ip}:{config.SERVER_PORT}...")
+        client_socket.connect((target_server_ip, config.SERVER_PORT))
+        
+        my_username = input("Enter your username: ")
 
-client_send_thread = threading.Thread(target=client_send) #creating a thread for sending messages to the server
-client_send_thread.start() #starting the thread for sending messages to the server
+        # Hide our dynamic UDP port in the body of the Login message
+        login_string = helpers.build_message("COMMAND", "LOGIN", my_username, "SERVER", body=str(my_udp_port))
+        client_socket.sendall(helpers.encode_message(login_string))
+
+        reply_bytes = client_socket.recv(config.BUFFER_SIZE)
+        print(f"[*] Server replied: {helpers.parse_message(helpers.decode_message(reply_bytes))[1]}\n")
+
+        # Start the TCP text listener in the background
+        threading.Thread(target=receive_tcp_messages, args=(client_socket,), daemon=True).start()
+
+        # 3. Main Interface Loop
+        while True:
+            chat_text = input(" > ")
+            if chat_text.lower() == 'exit': 
+                break 
+                
+            # COMMAND ROUTER:
+            # 1. Private Messages (/msg)
+            if chat_text.startswith("/msg "):
+                parts = chat_text.split(" ", 2) 
+                if len(parts) >= 3:
+                    target_user = parts[1]
+                    private_message = helpers.build_message("DATA", "TEXT", my_username, target_user, parts[2])
+                    client_socket.sendall(helpers.encode_message(private_message))
+                else:
+                    print("Usage: /msg <username> <your message>")
+                continue 
+                
+            # 2. P2P File Transfers (/sendfile)
+            if chat_text.startswith("/sendfile "):
+                parts = chat_text.split(" ")
+                if len(parts) >= 3:
+                    pending_target = parts[1]
+                    pending_file = parts[2]
+                    # Ask server for IP. The background TCP thread will catch the reply and start the transfer.
+                    lookup_msg = helpers.build_message("COMMAND", "PEER_LOOKUP", my_username, pending_target)
+                    client_socket.sendall(helpers.encode_message(lookup_msg))
+                else:
+                    print("Usage: /sendfile <username> <filename>")
+                continue 
+                
+            # 3. Manual IP Lookup (/lookup)
+            if chat_text.startswith("/lookup "):
+                parts = chat_text.split(" ")
+                if len(parts) > 1:
+                    lookup_msg = helpers.build_message("COMMAND", "PEER_LOOKUP", my_username, parts[1])
+                    client_socket.sendall(helpers.encode_message(lookup_msg))
+                continue
+                
+            # DEFAULT: Broadcast to the Group
+            chat_message = helpers.build_message("DATA", "TEXT", my_username, "GROUP", chat_text)
+            client_socket.sendall(helpers.encode_message(chat_message))
+
+    except Exception as e:
+        print(f"[-] Disconnected. Error: {e}")
+    finally:
+        client_socket.close()
+
+if __name__ == "__main__":
+    start_protocol_client()
