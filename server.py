@@ -45,12 +45,17 @@ def handle_client(conn, addr):
                 current_user = sender
                 client_udp_port = body # The client hides its dynamic UDP port in the body
                 
+                # FIX: If the client connected via localhost, swap it with the server's actual LAN IP
+                client_ip = addr[0]
+                if client_ip == '127.0.0.1':
+                    client_ip = get_local_ip()
+                
                 active_users[current_user] = {
                     "conn": conn, 
-                    "ip": addr[0], 
+                    "ip": client_ip, # <-- Now using the corrected IP
                     "udp_port": client_udp_port
                 }
-                print(f"[*] {current_user} logged in (IP: {addr[0]}, UDP: {client_udp_port}).")
+                print(f"[*] {current_user} logged in (IP: {client_ip}, UDP: {client_udp_port}).")
                 
                 ack_msg = helpers.build_message("CONTROL", "ACK", "SERVER", current_user, "Login successful!")
                 conn.sendall(helpers.encode_message(ack_msg))
