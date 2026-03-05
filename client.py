@@ -23,19 +23,28 @@ def listen_for_udp_files(udp_socket):
     """
     file_open = False
     f = None
+    save_filename = "p2p_received_media.mp4"
+
     while True:
         try:
             data, addr = udp_socket.recvfrom(4096)
+            
+            if data.startswith(b"FILENAME:"):
+                raw_name = data.decode(config.ENCODING).split(":", 1)[1]
+                save_filename = os.path.basename(raw_name)
+                continue
+
             if data == b"EOF":
                 if f:
                     f.close()
                     file_open = False
-                print("\n[P2P SYSTEM]: Incoming media transfer complete! Saved as 'p2p_received_media.mp4'")
+                print(f"\n[P2P SYSTEM]: Incoming media transfer complete! Saved as '{save_filename}'")
                 print(" > ", end="", flush=True) # Reset UI prompt
+                save_filename = "p2p_received_media.mp4"
             else:
                 # Open the file container on the first packet received
                 if not file_open:
-                    f = open("p2p_received_media.mp4", "wb")
+                    f = open(save_filename, "wb")
                     file_open = True
                 f.write(data)
         except Exception:
@@ -54,6 +63,11 @@ def send_file_udp_task(target_ip, target_port, filepath):
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     print(f"\n[P2P SYSTEM]: Blasting '{filepath}' to {target_ip}:{target_port} via UDP...")
     
+    # Send filename header
+    filename = os.path.basename(filepath)
+    udp_socket.sendto(f"FILENAME:{filename}".encode(config.ENCODING), (target_ip, target_port))
+    time.sleep(0.02)
+
     start_time = time.time()
     with open(filepath, 'rb') as file:
         while True:
