@@ -220,6 +220,7 @@ def start_protocol_client():
         print(f"[-] Disconnected. Error: {e}")
     finally:
         client_socket.close()
+        # Siyabonga you piece of shiiiii
 
 if __name__ == "__main__":
     start_protocol_client()
