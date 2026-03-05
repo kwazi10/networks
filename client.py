@@ -82,12 +82,12 @@ def send_file_udp_task(targets, filepath):
     # 2. Blast the File Chunks to all targets
     with open(filepath, 'rb') as file:
         while True:
-            chunk = file.read(4096)
+            chunk = file.read(1024) # LOWERED FROM 4096 TO PREVENT FRAGMENTATION
             if not chunk: break
             
             for ip, port in targets:
                 udp_socket.sendto(chunk, (ip, port))
-            time.sleep(0.001) # Prevent local buffer overflow
+            time.sleep(0.001)
             
     # 3. Blast the EOF flag to all targets
     for ip, port in targets:
