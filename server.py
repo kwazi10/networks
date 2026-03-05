@@ -1,6 +1,6 @@
 # ==========================================
 # server.py
-# Central multi-threaded TCP Server
+# Central multi-threaded TCP Server & Directory
 # ==========================================
 import socket
 import threading
@@ -14,7 +14,6 @@ def get_local_ip():
     """Utility to auto-detect the Server host's Wi-Fi IPv4 address."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        # Doesn't actually connect, just tests the routing table
         s.connect(('10.255.255.255', 1))
         IP = s.getsockname()[0]
     except Exception:
@@ -26,7 +25,7 @@ def get_local_ip():
 def handle_client(conn, addr):
     """
     Runs in a background thread for EVERY connected user.
-    Constantly listens for incoming protocol messages and routes them appropriately.
+    Constantly listens for incoming TCP protocol messages and routes them.
     """
     current_user = None 
     
@@ -34,19 +33,17 @@ def handle_client(conn, addr):
         while True:
             raw_bytes = conn.recv(config.BUFFER_SIZE)
             if not raw_bytes: 
-                break # Client disconnected
+                break 
             
-            # Parse the incoming message using our custom protocol
             headers, body = helpers.parse_message(helpers.decode_message(raw_bytes))
             command = headers.get("Command")
             sender = headers.get("SenderID")
             recipient = headers.get("RecipientID")
             
             # --- SCENARIO 1: CLIENT LOGIN ---
-            # Save their socket, IP, and the dynamic UDP port they sent in the body
             if command == "LOGIN":
                 current_user = sender
-                client_udp_port = body 
+                client_udp_port = body # The client hides its dynamic UDP port in the body
                 
                 active_users[current_user] = {
                     "conn": conn, 
@@ -58,12 +55,11 @@ def handle_client(conn, addr):
                 ack_msg = helpers.build_message("CONTROL", "ACK", "SERVER", current_user, "Login successful!")
                 conn.sendall(helpers.encode_message(ack_msg))
 
-            # --- SCENARIO 2: GROUP CHAT (Broadcast) ---
+            # --- SCENARIO 2: GROUP CHAT (TCP Broadcast) ---
             elif command == "TEXT" and recipient == "GROUP":
                 forward_msg = helpers.build_message("DATA", "TEXT", sender, "GROUP", body)
                 encoded_msg = helpers.encode_message(forward_msg)
                 
-                # Send to everyone except the person who wrote the message
                 for user, user_data in active_users.items():
                     if user != sender: 
                         try:
@@ -71,7 +67,7 @@ def handle_client(conn, addr):
                         except Exception:
                             pass
 
-            # --- SCENARIO 3: PRIVATE CHAT (Direct Routing) ---
+            # --- SCENARIO 3: PRIVATE CHAT (TCP Direct Routing) ---
             elif command == "TEXT" and recipient != "GROUP":
                 target_user = recipient 
                 
@@ -86,10 +82,19 @@ def handle_client(conn, addr):
                     conn.sendall(helpers.encode_message(error_msg))
 
             # --- SCENARIO 4: P2P DISCOVERY (IP Directory) ---
-            # A client asks for another user's IP/UDP port to start a direct file transfer
             elif command == "PEER_LOOKUP":
                 target_user = recipient 
-                if target_user in active_users:
+                
+                # Requesting IPs for a UDP Multicast to the whole group
+                if target_user == "GROUP":
+                    peers = [f"{info['ip']}:{info['udp_port']}" for user, info in active_users.items() if user != sender]
+                    reply_body = ",".join(peers) 
+                    
+                    reply_msg = helpers.build_message("CONTROL", "GROUP_INFO", "SERVER", sender, reply_body)
+                    conn.sendall(helpers.encode_message(reply_msg))
+                    
+                # Requesting IP for a single peer UDP transfer
+                elif target_user in active_users:
                     target_ip = active_users[target_user]["ip"]
                     target_udp = active_users[target_user]["udp_port"]
                     
@@ -101,9 +106,8 @@ def handle_client(conn, addr):
                     conn.sendall(helpers.encode_message(error_msg))
 
     except ConnectionResetError:
-        pass # Handle abrupt client disconnections silently
+        pass 
     finally:
-        # Cleanup when the thread dies
         if current_user and current_user in active_users:
             del active_users[current_user]
             print(f"[-] {current_user} disconnected.")
@@ -114,7 +118,6 @@ def start_threaded_server():
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
-    # Bind to 0.0.0.0 to allow connections from local machine AND external Wi-Fi
     server_socket.bind(('0.0.0.0', config.SERVER_PORT))
     server_socket.listen(5) 
     
@@ -128,7 +131,6 @@ def start_threaded_server():
     try:
         while True: 
             conn, addr = server_socket.accept()
-            # Spawn a new thread for the user so the server doesn't freeze
             threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
     except KeyboardInterrupt:
         print("\n[*] Server shutting down manually.")
