@@ -190,15 +190,25 @@ def start_protocol_client():
         print(f"[*] Connecting to {target_server_ip}:{config.SERVER_PORT}...")
         client_socket.connect((target_server_ip, config.SERVER_PORT))
         
-        my_username = input("Enter your username: ")
+        my_username = input("Enter your username: ").strip()
+        my_password = input("Enter your password: ").strip()
 
-        # Hide our dynamic UDP port in the body of the Login message
-        login_string = helpers.build_message("COMMAND", "LOGIN", my_username, "SERVER", body=str(my_udp_port))
+        # Hide our password and dynamic UDP port in the body of the Login message
+        login_body = f"{my_password}:{my_udp_port}"
+        login_string = helpers.build_message("COMMAND", "LOGIN", my_username, "SERVER", body=login_body)
         client_socket.sendall(helpers.encode_message(login_string))
 
         reply_bytes = client_socket.recv(config.BUFFER_SIZE)
-        print(f"[*] Server replied: {helpers.parse_message(helpers.decode_message(reply_bytes))[1]}\n")
+        if not reply_bytes:
+            print("[-] Server closed the connection during login. Exiting.")
+            return
 
+        headers, body = helpers.parse_message(helpers.decode_message(reply_bytes))
+        print(f"[*] Server replied: {body}\n")
+
+        # If login failed, the server sends an ERROR and closes the connection.
+        if headers.get("Command") == "ERROR":
+            return # Exit the function, which will lead to the finally block
         # Start the TCP text listener in the background
         threading.Thread(target=receive_tcp_messages, args=(client_socket,), daemon=True).start()
 
