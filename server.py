@@ -7,13 +7,11 @@ import threading
 import config
 import helpers
 
-# Stores active connections: { "Username": {"conn": socket, "ip": "192.168.X.X", "udp_port": "12345"} }
 active_users = {}
-# Stores registered users from file: { "Username": "password" }
 registered_users = {}
+approved_dms = {}
 
 def load_users(filename="users.txt"):
-    """Loads users and passwords from a flat file."""
     global registered_users
     try:
         with open(filename, "r") as f:
@@ -28,8 +26,15 @@ def load_users(filename="users.txt"):
     except Exception as e:
         print(f"[!] ERROR: Could not load users from {filename}. {e}")
 
+def save_new_user(username, password, filename="users.txt"):
+    global registered_users
+    try:
+        with open(filename, "a") as f:
+            f.write(f"\n{username} {password}")
+    except Exception as e:
+        print(f"[!] ERROR: Could not save new user to {filename}. {e}")
+
 def get_local_ip():
-    """Utility to auto-detect the Server host's Wi-Fi IPv4 address."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(('10.255.255.255', 1))
@@ -41,10 +46,6 @@ def get_local_ip():
     return IP
 
 def handle_client(conn, addr):
-    """
-    Runs in a background thread for EVERY connected user.
-    Constantly listens for incoming TCP protocol messages and routes them.
-    """
     current_user = None 
     
     try:
@@ -58,49 +59,98 @@ def handle_client(conn, addr):
             sender = headers.get("SenderID")
             recipient = headers.get("RecipientID")
             
-            # --- SCENARIO 1: CLIENT LOGIN ---
-            if command == "LOGIN":
-                # Body format is expected to be: <password>:<udp_port>
+            # --- ACCOUNT REGISTRATION ---
+            if command == "REGISTER":
                 try:
                     password, client_udp_port = body.split(":", 1)
                 except ValueError:
-                    print(f"[-] Malformed LOGIN from {addr[0]}. Body: '{body}'")
-                    break # Close connection
+                    continue
 
-                # Check if user is already logged in
-                if sender in active_users:
-                    print(f"[-] User '{sender}' attempted to log in again.")
-                    error_msg = helpers.build_message("CONTROL", "ERROR", "SERVER", sender, f"User '{sender}' is already logged in.")
+                if sender in registered_users:
+                    error_msg = helpers.build_message("CONTROL", "ERROR", "SERVER", sender, f"Username '{sender}' is already taken. Please login.")
                     conn.sendall(helpers.encode_message(error_msg))
-                    break
+                    continue
+                
+                registered_users[sender] = password
+                save_new_user(sender, password)
+                
+                current_user = sender
+                client_ip = addr[0] if addr[0] != '127.0.0.1' else get_local_ip()
+                
+                active_users[current_user] = {"conn": conn, "ip": client_ip, "udp_port": client_udp_port}
+                ack_msg = helpers.build_message("CONTROL", "ACK", "SERVER", current_user, "Account created! You are now logged in.")
+                conn.sendall(helpers.encode_message(ack_msg))
+                continue
 
-                # AUTHENTICATION CHECK
+            # --- CLIENT LOGIN ---
+            elif command == "LOGIN":
+                try:
+                    password, client_udp_port = body.split(":", 1)
+                except ValueError:
+                    continue
+
+                if sender in active_users:
+                    error_msg = helpers.build_message("CONTROL", "ERROR", "SERVER", sender, f"User '{sender}' is already logged in elsewhere.")
+                    conn.sendall(helpers.encode_message(error_msg))
+                    continue
+
                 if sender in registered_users and registered_users[sender] == password:
-                    # Authentication successful
                     current_user = sender
+                    client_ip = addr[0] if addr[0] != '127.0.0.1' else get_local_ip()
                     
-                    # FIX: If the client connected via localhost, swap it with the server's actual LAN IP
-                    client_ip = addr[0]
-                    if client_ip == '127.0.0.1':
-                        client_ip = get_local_ip()
-                    
-                    active_users[current_user] = {
-                        "conn": conn, 
-                        "ip": client_ip, # <-- Now using the corrected IP
-                        "udp_port": client_udp_port
-                    }
-                    print(f"[*] {current_user} logged in (IP: {client_ip}, UDP: {client_udp_port}).")
-                    
+                    active_users[current_user] = {"conn": conn, "ip": client_ip, "udp_port": client_udp_port}
                     ack_msg = helpers.build_message("CONTROL", "ACK", "SERVER", current_user, "Login successful!")
                     conn.sendall(helpers.encode_message(ack_msg))
                 else:
-                    # Authentication failed
-                    print(f"[-] Failed login attempt for user '{sender}' from {addr[0]}.")
-                    error_msg = helpers.build_message("CONTROL", "ERROR", "SERVER", sender, "Authentication failed. Invalid username or password.")
+                    error_msg = helpers.build_message("CONTROL", "ERROR", "SERVER", sender, "Invalid username or password.")
                     conn.sendall(helpers.encode_message(error_msg))
-                    break # Terminate connection
+                continue
 
-            # --- SCENARIO 2: GROUP CHAT (TCP Broadcast) ---
+            # --- FETCH ONLINE USERS ---
+            elif command == "ONLINE_USERS":
+                online_list = [u for u in active_users.keys() if u != sender]
+                users_str = ", ".join(online_list) if online_list else "No one else is currently online."
+                reply = helpers.build_message("CONTROL", "ONLINE_LIST", "SERVER", sender, users_str)
+                conn.sendall(helpers.encode_message(reply))
+
+            # --- FORMAL CONNECTION REQUEST ---
+            elif command == "REQUEST_DM":
+                target_user = recipient
+                if target_user in active_users:
+                    if target_user == sender:
+                        error_msg = helpers.build_message("CONTROL", "ERROR", "SERVER", sender, "You cannot request a connection with yourself.")
+                        conn.sendall(helpers.encode_message(error_msg))
+                        continue
+                        
+                    notice = helpers.build_message("CONTROL", "INFO", "SERVER", sender, f"Connection request sent to {target_user}. Waiting for their approval...")
+                    conn.sendall(helpers.encode_message(notice))
+                    
+                    req = helpers.build_message("CONTROL", "DM_REQUEST", "SERVER", target_user, sender)
+                    active_users[target_user]["conn"].sendall(helpers.encode_message(req))
+                else:
+                    error_msg = helpers.build_message("CONTROL", "ERROR", "SERVER", sender, f"User '{target_user}' is offline.")
+                    conn.sendall(helpers.encode_message(error_msg))
+
+            # --- ACCEPT PRIVATE MESSAGES ---
+            elif command == "ACCEPT_DM":
+                target_user = recipient 
+                
+                if sender not in approved_dms:
+                    approved_dms[sender] = set()
+                approved_dms[sender].add(target_user)
+                
+                if target_user not in approved_dms:
+                    approved_dms[target_user] = set()
+                approved_dms[target_user].add(sender)
+                
+                ack = helpers.build_message("CONTROL", "INFO", "SERVER", sender, f"Connection established! You can now send private messages and files to {target_user}.")
+                conn.sendall(helpers.encode_message(ack))
+                
+                if target_user in active_users:
+                    notify = helpers.build_message("CONTROL", "INFO", "SERVER", target_user, f"{sender} accepted your request! You can now message them privately.")
+                    active_users[target_user]["conn"].sendall(helpers.encode_message(notify))
+
+            # --- GROUP CHAT ---
             elif command == "TEXT" and recipient == "GROUP":
                 forward_msg = helpers.build_message("DATA", "TEXT", sender, "GROUP", body)
                 encoded_msg = helpers.encode_message(forward_msg)
@@ -112,40 +162,44 @@ def handle_client(conn, addr):
                         except Exception:
                             pass
 
-            # --- SCENARIO 3: PRIVATE CHAT (TCP Direct Routing) ---
+            # --- PRIVATE CHAT (STRICT APPROVAL) ---
             elif command == "TEXT" and recipient != "GROUP":
                 target_user = recipient 
                 
                 if target_user in active_users:
-                    forward_msg = helpers.build_message("DATA", "TEXT", sender, target_user, body)
-                    try:
-                        active_users[target_user]["conn"].sendall(helpers.encode_message(forward_msg))
-                    except Exception:
-                        pass
+                    if target_user in approved_dms and sender in approved_dms[target_user]:
+                        forward_msg = helpers.build_message("DATA", "TEXT", sender, target_user, body)
+                        try:
+                            active_users[target_user]["conn"].sendall(helpers.encode_message(forward_msg))
+                        except Exception:
+                            pass
+                    else:
+                        error_msg = helpers.build_message("CONTROL", "ERROR", "SERVER", sender, f"Connection rejected. Type '/request {target_user}' to establish a private channel first.")
+                        conn.sendall(helpers.encode_message(error_msg))
                 else:
-                    error_msg = helpers.build_message("CONTROL", "ERROR", "SERVER", sender, f"User '{target_user}' offline.")
+                    error_msg = helpers.build_message("CONTROL", "ERROR", "SERVER", sender, f"User '{target_user}' is offline.")
                     conn.sendall(helpers.encode_message(error_msg))
 
-            # --- SCENARIO 4: P2P DISCOVERY (IP Directory) ---
+            # --- P2P FILE DIRECTORY (STRICT APPROVAL) ---
             elif command == "PEER_LOOKUP":
                 target_user = recipient 
                 
-                # Requesting IPs for a UDP Multicast to the whole group
                 if target_user == "GROUP":
                     peers = [f"{info['ip']}:{info['udp_port']}" for user, info in active_users.items() if user != sender]
                     reply_body = ",".join(peers) 
-                    
                     reply_msg = helpers.build_message("CONTROL", "GROUP_INFO", "SERVER", sender, reply_body)
                     conn.sendall(helpers.encode_message(reply_msg))
                     
-                # Requesting IP for a single peer UDP transfer
                 elif target_user in active_users:
-                    target_ip = active_users[target_user]["ip"]
-                    target_udp = active_users[target_user]["udp_port"]
-                    
-                    reply_body = f"{target_ip}:{target_udp}"
-                    reply_msg = helpers.build_message("CONTROL", "PEER_INFO", "SERVER", sender, reply_body)
-                    conn.sendall(helpers.encode_message(reply_msg))
+                    if target_user in approved_dms and sender in approved_dms[target_user]:
+                        target_ip = active_users[target_user]["ip"]
+                        target_udp = active_users[target_user]["udp_port"]
+                        reply_body = f"{target_ip}:{target_udp}"
+                        reply_msg = helpers.build_message("CONTROL", "PEER_INFO", "SERVER", sender, reply_body)
+                        conn.sendall(helpers.encode_message(reply_msg))
+                    else:
+                        error_msg = helpers.build_message("CONTROL", "ERROR", "SERVER", sender, f"Cannot send file. Type '/request {target_user}' to establish a private channel first.")
+                        conn.sendall(helpers.encode_message(error_msg))
                 else:
                     error_msg = helpers.build_message("CONTROL", "ERROR", "SERVER", sender, "User offline.")
                     conn.sendall(helpers.encode_message(error_msg))
@@ -159,18 +213,16 @@ def handle_client(conn, addr):
         conn.close()
 
 def start_threaded_server():
-    """Initializes the server socket and accepts incoming TCP connections."""
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
     server_socket.bind(('0.0.0.0', config.SERVER_PORT))
-    load_users() # Load the user database
+    load_users() 
     server_socket.listen(5) 
     
-    host_ip = get_local_ip()
     print("==================================================")
     print(f"[*] CENTRAL SERVER ONLINE")
-    print(f"[*] Tell clients to connect to IP: {host_ip}")
+    print(f"[*] Tell clients to connect to IP: {get_local_ip()}")
     print(f"[*] Port: {config.SERVER_PORT}")
     print("==================================================")
 
@@ -179,7 +231,7 @@ def start_threaded_server():
             conn, addr = server_socket.accept()
             threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
     except KeyboardInterrupt:
-        print("\n[*] Server shutting down manually.")
+        pass
     finally:
         server_socket.close()
 

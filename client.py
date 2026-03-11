@@ -1,6 +1,6 @@
 # ==========================================
 # client.py
-# Unified multi-threaded TCP & UDP Client
+# GUI-Ready Chat Client
 # ==========================================
 import socket
 import threading
@@ -9,27 +9,21 @@ import helpers
 import os
 import time
 
-# Tracks P2P file transfer states
 pending_target = None
 pending_file = None
 
 # ==========================================
-# SECTION 1: UDP P2P MEDIA TRANSFER
+# SECTION 1: BACKGROUND FILE TRANSFERS
 # ==========================================
 def listen_for_udp_files(udp_socket):
-    """
-    Runs in a background thread. Constantly listens on the dynamic UDP port 
-    for incoming P2P file transfers and extracts the filename metadata.
-    """
     file_open = False
     f = None
-    filename = "p2p_received_media.file" 
+    filename = "received_file.dat" 
     
     while True:
         try:
             data, addr = udp_socket.recvfrom(4096)
             
-            # Catch the Metadata packet to extract the true filename
             if data.startswith(b"META:"):
                 original_name = data[5:].decode(config.ENCODING)
                 filename = f"received_{original_name}" 
@@ -38,74 +32,77 @@ def listen_for_udp_files(udp_socket):
                 f = open(filename, "wb")
                 file_open = True
                 
-                print(f"\n[P2P SYSTEM]: Incoming file detected! Catching '{filename}'...")
+                print(f"\n[App]: Receiving file '{filename}'...")
                 print(" > ", end="", flush=True)
                 
             elif data == b"EOF":
                 if f:
                     f.close()
                     file_open = False
-                print(f"\n[P2P SYSTEM]: Media transfer complete! Saved successfully as '{filename}'")
+                print(f"\n[App]: File received successfully! Saved as '{filename}'")
                 print(" > ", end="", flush=True)
             else:
-                # Write the raw media bytes to the file
                 if file_open and f:
                     f.write(data)
         except Exception:
             break
 
 def send_file_udp_task(targets, filepath):
-    """
-    Spawns temporarily to blast a file over connectionless UDP.
-    Can send to a single peer, or multicast to a list of multiple peers.
-    """
     filename = os.path.basename(filepath)
     
-    # Auto-generate dummy files if testing a file that doesn't exist locally
     if not os.path.exists(filepath):
-        print(f"\n[SYSTEM] Auto-generating 5MB dummy file '{filepath}' for transfer test...")
+        print(f"\n[App]: Test file '{filename}' created for sending...")
         with open(filepath, 'wb') as dummy:
             dummy.write(os.urandom(5 * 1024 * 1024)) 
 
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    print(f"\n[P2P SYSTEM]: Blasting '{filename}' to {len(targets)} peer(s) via UDP...")
+    
+    if len(targets) > 1:
+        print(f"\n[App]: Sending '{filename}' to the group...")
+    else:
+        print(f"\n[App]: Sending '{filename}'...")
     
     start_time = time.time()
     
-    # 1. Blast the Metadata (Filename) to all targets
     meta_packet = b"META:" + filename.encode(config.ENCODING)
     for ip, port in targets:
         udp_socket.sendto(meta_packet, (ip, port))
         
-    time.sleep(0.05) # Allow receivers 50ms to open their local files
+    time.sleep(0.05) 
     
-    # 2. Blast the File Chunks to all targets
     with open(filepath, 'rb') as file:
         while True:
-            chunk = file.read(1024) # LOWERED FROM 4096 TO PREVENT FRAGMENTATION
+            chunk = file.read(1024) 
             if not chunk: break
-            
             for ip, port in targets:
                 udp_socket.sendto(chunk, (ip, port))
             time.sleep(0.001)
             
-    # 3. Blast the EOF flag to all targets
     for ip, port in targets:
         udp_socket.sendto(b"EOF", (ip, port))
         
     end_time = time.time()
-    print(f"\n[P2P SYSTEM]: Transfer finished in {round(end_time - start_time, 4)} seconds!")
+    print(f"\n[App]: File sent successfully in {round(end_time - start_time, 1)} seconds.")
     print(" > ", end="", flush=True)
     udp_socket.close()
 
 # ==========================================
-# SECTION 2: TCP CHAT CLIENT FUNCTIONS
+# SECTION 2: CHAT INTERFACE AND NOTIFICATIONS
 # ==========================================
+def display_help():
+    """Prints a user-friendly manual for the application commands."""
+    print("\n=================== APPLICATION MENU ===================")
+    print(" [Type text]             : Chat normally with the entire Group.")
+    print(" /online                 : View a list of all online users.")
+    print(" /request <username>     : Request a secure private connection with a user.")
+    print(" /accept <username>      : Accept a user's private connection request.")
+    print(" /msg <username> <text>  : Send a private message (requires an accepted request).")
+    print(" /sendfile <name> <file> : Send a file securely to a user or the GROUP.")
+    print(" /help                   : Display this instruction menu.")
+    print(" exit                    : Close the application.")
+    print("========================================================")
+
 def receive_tcp_messages(sock):
-    """
-    Runs in a background thread. Listens for server text broadcasts, 
-    private messages, and directory lookup responses.
-    """
     global pending_target, pending_file
     while True:
         try:
@@ -114,18 +111,18 @@ def receive_tcp_messages(sock):
                 
             headers, body = helpers.parse_message(helpers.decode_message(raw_bytes))
             
-            # --- SCENARIO A: Text Messages ---
+            # --- Text Messages ---
             if headers.get("MessageType") == "DATA" and headers.get("Command") == "TEXT":
                 sender = headers.get("SenderID")
                 recipient = headers.get("RecipientID")
                 
                 if recipient == "GROUP":
-                    print(f"\n[{sender} to GROUP]: {body}")
+                    print(f"\n[{sender} to Group]: {body}")
                 else:
-                    print(f"\n[PRIVATE from {sender}]: {body}")
+                    print(f"\n[Private from {sender}]: {body}")
                 print(" > ", end="", flush=True) 
                 
-            # --- SCENARIO B: Single User IP Response ---
+            # --- Background Locating for Files ---
             elif headers.get("MessageType") == "CONTROL" and headers.get("Command") == "PEER_INFO":
                 target_ip = body.split(":")[0]
                 target_port = int(body.split(":")[1])
@@ -135,14 +132,10 @@ def receive_tcp_messages(sock):
                     threading.Thread(target=send_file_udp_task, args=(targets, pending_file), daemon=True).start()
                     pending_file = None 
                     pending_target = None
-                else:
-                    print(f"\n[SERVER DIRECTORY]: Peer is at {body}")
-                    print(" > ", end="", flush=True)
                     
-            # --- SCENARIO C: Group IPs Response (Multicast Setup) ---
             elif headers.get("MessageType") == "CONTROL" and headers.get("Command") == "GROUP_INFO":
                 if not body:
-                    print("\n[SERVER DIRECTORY]: No other users online to receive the file.")
+                    print("\n[App]: No other users are currently online to receive the file.")
                     print(" > ", end="", flush=True)
                     pending_file = None
                     pending_target = None
@@ -159,9 +152,22 @@ def receive_tcp_messages(sock):
                     pending_file = None 
                     pending_target = None
 
-            # --- SCENARIO D: Errors ---
+            # --- User Interface Notifications ---
+            elif headers.get("MessageType") == "CONTROL" and headers.get("Command") == "ONLINE_LIST":
+                print(f"\n[App]: Users currently online: {body}")
+                print(" > ", end="", flush=True)
+
+            elif headers.get("MessageType") == "CONTROL" and headers.get("Command") == "DM_REQUEST":
+                sender_requesting = body
+                print(f"\n[Notification]: '{sender_requesting}' wants to open a private connection with you! Type '/accept {sender_requesting}' to allow.")
+                print(" > ", end="", flush=True)
+
+            elif headers.get("MessageType") == "CONTROL" and headers.get("Command") == "INFO":
+                print(f"\n[Notification]: {body}")
+                print(" > ", end="", flush=True)
+
             elif headers.get("MessageType") == "CONTROL" and headers.get("Command") == "ERROR":
-                print(f"\n[SERVER ERROR]: {body}")
+                print(f"\n[Error]: {body}")
                 print(" > ", end="", flush=True)
                 pending_file = None 
                 
@@ -169,57 +175,94 @@ def receive_tcp_messages(sock):
             break
 
 def start_protocol_client():
-    """Initializes sockets, handles login, and runs the main user input loop."""
     global pending_target, pending_file
     
-    # 1. Bind the UDP socket to a random dynamic port for receiving files
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_socket.bind(('0.0.0.0', 0)) 
     my_udp_port = udp_socket.getsockname()[1]
-    
     threading.Thread(target=listen_for_udp_files, args=(udp_socket,), daemon=True).start()
     
-    # 2. Establish the primary TCP connection to the Central Server
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        print("--- Chat Client Startup ---")
-        target_server_ip = input("Enter Server IP (Press Enter for Localhost): ").strip()
+        print("--- Welcome to the Chat Application ---")
+        target_server_ip = input("Enter the Server IP Address (or press Enter for default): ").strip()
         if target_server_ip == "":
             target_server_ip = '127.0.0.1'
             
-        print(f"[*] Connecting to {target_server_ip}:{config.SERVER_PORT}...")
+        print(f"[*] Connecting...")
         client_socket.connect((target_server_ip, config.SERVER_PORT))
+        print(f"[App]: Connected to server!\n")
         
-        my_username = input("Enter your username: ").strip()
-        my_password = input("Enter your password: ").strip()
+        while True:
+            print("=====================================")
+            print("1. Login to an existing account")
+            print("2. Create a new account")
+            print("=====================================")
+            choice = input("Select an option (1 or 2): ").strip()
+            
+            if choice not in ['1', '2']:
+                print("[-] Invalid choice. Please type 1 or 2.")
+                continue
+                
+            cmd_type = "LOGIN" if choice == '1' else "REGISTER"
+            
+            my_username = input("Username: ").strip()
+            my_password = input("Password: ").strip()
 
-        # Hide our password and dynamic UDP port in the body of the Login message
-        login_body = f"{my_password}:{my_udp_port}"
-        login_string = helpers.build_message("COMMAND", "LOGIN", my_username, "SERVER", body=login_body)
-        client_socket.sendall(helpers.encode_message(login_string))
+            login_body = f"{my_password}:{my_udp_port}"
+            login_string = helpers.build_message("COMMAND", cmd_type, my_username, "SERVER", body=login_body)
+            client_socket.sendall(helpers.encode_message(login_string))
 
-        reply_bytes = client_socket.recv(config.BUFFER_SIZE)
-        if not reply_bytes:
-            print("[-] Server closed the connection during login. Exiting.")
-            return
+            reply_bytes = client_socket.recv(config.BUFFER_SIZE)
+            if not reply_bytes:
+                print("[Error]: Server disconnected.")
+                return
 
-        headers, body = helpers.parse_message(helpers.decode_message(reply_bytes))
-        print(f"[*] Server replied: {body}\n")
+            headers, body = helpers.parse_message(helpers.decode_message(reply_bytes))
+            print(f"\n[Notification]: {body}")
 
-        # If login failed, the server sends an ERROR and closes the connection.
-        if headers.get("Command") == "ERROR":
-            return # Exit the function, which will lead to the finally block
-        # Start the TCP text listener in the background
+            if headers.get("Command") == "ACK":
+                break 
+
         threading.Thread(target=receive_tcp_messages, args=(client_socket,), daemon=True).start()
 
-        # 3. Main Interface Loop
+        # Display the help menu immediately upon successful login!
+        display_help()
+        
         while True:
             chat_text = input(" > ")
             if chat_text.lower() == 'exit': 
                 break 
                 
-            # COMMAND ROUTER:
-            # 1. Private Messages (/msg)
+            if chat_text == "/help":
+                display_help()
+                continue
+                
+            if chat_text == "/online":
+                req_msg = helpers.build_message("COMMAND", "ONLINE_USERS", my_username, "SERVER")
+                client_socket.sendall(helpers.encode_message(req_msg))
+                continue
+                
+            if chat_text.startswith("/request "):
+                parts = chat_text.split(" ")
+                if len(parts) >= 2:
+                    target_user = parts[1]
+                    req_msg = helpers.build_message("COMMAND", "REQUEST_DM", my_username, target_user)
+                    client_socket.sendall(helpers.encode_message(req_msg))
+                else:
+                    print("[App]: Incorrect format. Type -> /request <username>")
+                continue
+
+            if chat_text.startswith("/accept "):
+                parts = chat_text.split(" ")
+                if len(parts) >= 2:
+                    target_user = parts[1]
+                    accept_msg = helpers.build_message("COMMAND", "ACCEPT_DM", my_username, target_user)
+                    client_socket.sendall(helpers.encode_message(accept_msg))
+                else:
+                    print("[App]: Incorrect format. Type -> /accept <username>")
+                continue 
+
             if chat_text.startswith("/msg "):
                 parts = chat_text.split(" ", 2) 
                 if len(parts) >= 3:
@@ -227,10 +270,9 @@ def start_protocol_client():
                     private_message = helpers.build_message("DATA", "TEXT", my_username, target_user, parts[2])
                     client_socket.sendall(helpers.encode_message(private_message))
                 else:
-                    print("Usage: /msg <username> <your message>")
+                    print("[App]: Incorrect format. Type -> /msg <username> <message>")
                 continue 
                 
-            # 2. P2P File Transfers (/sendfile)
             if chat_text.startswith("/sendfile "):
                 parts = chat_text.split(" ")
                 if len(parts) >= 3:
@@ -239,23 +281,15 @@ def start_protocol_client():
                     lookup_msg = helpers.build_message("COMMAND", "PEER_LOOKUP", my_username, pending_target)
                     client_socket.sendall(helpers.encode_message(lookup_msg))
                 else:
-                    print("Usage: /sendfile <username> <filename>")
+                    print("[App]: Incorrect format. Type -> /sendfile <username> <filename>")
                 continue 
                 
-            # 3. Manual IP Lookup (/lookup)
-            if chat_text.startswith("/lookup "):
-                parts = chat_text.split(" ")
-                if len(parts) > 1:
-                    lookup_msg = helpers.build_message("COMMAND", "PEER_LOOKUP", my_username, parts[1])
-                    client_socket.sendall(helpers.encode_message(lookup_msg))
-                continue
-                
-            # DEFAULT: Broadcast to the Group
+            # Send standard group chat message
             chat_message = helpers.build_message("DATA", "TEXT", my_username, "GROUP", chat_text)
             client_socket.sendall(helpers.encode_message(chat_message))
 
     except Exception as e:
-        print(f"[-] Disconnected. Error: {e}")
+        print(f"\n[Error]: Disconnected from server.")
     finally:
         client_socket.close()
 
