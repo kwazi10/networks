@@ -92,12 +92,16 @@ def send_file_udp_task(targets, filepath):
 def display_help():
     """Prints a user-friendly manual for the application commands."""
     print("\n=================== APPLICATION MENU ===================")
-    print(" [Type text]             : Chat normally with the entire Group.")
+    print(" /creategroup <name>     : Create a new custom chat group.")
+    print(" /invite <group> <user>  : Invite a user to a group.")
+    print(" /join <group>           : Accept an invite and join a group.")
+    print(" /gmsg <group> <text>    : Send a message to a specific group.")
+    print(" /gfile <group> <file>   : Send a file securely to a group.")
     print(" /online                 : View a list of all online users.")
     print(" /request <username>     : Request a secure private connection with a user.")
     print(" /accept <username>      : Accept a user's private connection request.")
     print(" /msg <username> <text>  : Send a private message (requires an accepted request).")
-    print(" /sendfile <name> <file> : Send a file securely to a user or the GROUP.")
+    print(" /sendfile <user> <file> : Send a file securely to a private user.")
     print(" /help                   : Display this instruction menu.")
     print(" exit                    : Close the application.")
     print("========================================================")
@@ -116,10 +120,7 @@ def receive_tcp_messages(sock):
                 sender = headers.get("SenderID")
                 recipient = headers.get("RecipientID")
                 
-                if recipient == "GROUP":
-                    print(f"\n[{sender} to Group]: {body}")
-                else:
-                    print(f"\n[Private from {sender}]: {body}")
+                print(f"\n[{sender} to {recipient}]: {body}")
                 print(" > ", end="", flush=True) 
                 
             # --- Background Locating for Files ---
@@ -160,6 +161,14 @@ def receive_tcp_messages(sock):
             elif headers.get("MessageType") == "CONTROL" and headers.get("Command") == "DM_REQUEST":
                 sender_requesting = body
                 print(f"\n[Notification]: '{sender_requesting}' wants to open a private connection with you! Type '/accept {sender_requesting}' to allow.")
+                print(" > ", end="", flush=True)
+                
+            elif headers.get("MessageType") == "CONTROL" and headers.get("Command") == "GROUP_INVITE":
+                try:
+                    group_name, owner = body.split(":", 1)
+                    print(f"\n[Notification]: '{owner}' invited you to join group '{group_name}'! Type '/join {group_name}' to enter.")
+                except ValueError:
+                    pass
                 print(" > ", end="", flush=True)
 
             elif headers.get("MessageType") == "CONTROL" and headers.get("Command") == "INFO":
@@ -226,13 +235,15 @@ def start_protocol_client():
 
         threading.Thread(target=receive_tcp_messages, args=(client_socket,), daemon=True).start()
 
-        # Display the help menu immediately upon successful login!
         display_help()
         
         while True:
-            chat_text = input(" > ")
+            chat_text = input(" > ").strip()
             if chat_text.lower() == 'exit': 
                 break 
+                
+            if not chat_text:
+                continue
                 
             if chat_text == "/help":
                 display_help()
@@ -283,10 +294,63 @@ def start_protocol_client():
                 else:
                     print("[App]: Incorrect format. Type -> /sendfile <username> <filename>")
                 continue 
-                
-            # Send standard group chat message
-            chat_message = helpers.build_message("DATA", "TEXT", my_username, "GROUP", chat_text)
-            client_socket.sendall(helpers.encode_message(chat_message))
+
+            # --- NEW GROUP COMMANDS ---
+            if chat_text.startswith("/creategroup "):
+                parts = chat_text.split(" ", 1)
+                if len(parts) >= 2:
+                    group_name = parts[1]
+                    msg = helpers.build_message("COMMAND", "CREATE_GROUP", my_username, "SERVER", group_name)
+                    client_socket.sendall(helpers.encode_message(msg))
+                else:
+                    print("[App]: Incorrect format. Type -> /creategroup <name>")
+                continue
+
+            if chat_text.startswith("/invite "):
+                parts = chat_text.split(" ")
+                if len(parts) >= 3:
+                    group_name = parts[1]
+                    target_user = parts[2]
+                    msg = helpers.build_message("COMMAND", "INVITE_GROUP", my_username, "SERVER", f"{group_name}:{target_user}")
+                    client_socket.sendall(helpers.encode_message(msg))
+                else:
+                    print("[App]: Incorrect format. Type -> /invite <groupname> <username>")
+                continue
+
+            if chat_text.startswith("/join "):
+                parts = chat_text.split(" ", 1)
+                if len(parts) >= 2:
+                    group_name = parts[1]
+                    msg = helpers.build_message("COMMAND", "ACCEPT_GROUP", my_username, "SERVER", group_name)
+                    client_socket.sendall(helpers.encode_message(msg))
+                else:
+                    print("[App]: Incorrect format. Type -> /join <groupname>")
+                continue
+
+            if chat_text.startswith("/gmsg "):
+                parts = chat_text.split(" ", 2)
+                if len(parts) >= 3:
+                    group_name = parts[1]
+                    text = parts[2]
+                    msg = helpers.build_message("DATA", "TEXT", my_username, group_name, text)
+                    client_socket.sendall(helpers.encode_message(msg))
+                else:
+                    print("[App]: Incorrect format. Type -> /gmsg <groupname> <message>")
+                continue
+
+            if chat_text.startswith("/gfile "):
+                parts = chat_text.split(" ")
+                if len(parts) >= 3:
+                    pending_target = parts[1] # Target is now the group name
+                    pending_file = parts[2]
+                    lookup_msg = helpers.build_message("COMMAND", "PEER_LOOKUP", my_username, pending_target)
+                    client_socket.sendall(helpers.encode_message(lookup_msg))
+                else:
+                    print("[App]: Incorrect format. Type -> /gfile <groupname> <filename>")
+                continue 
+
+            if not chat_text.startswith("/"):
+                print("[App]: Global chat is disabled. Please use /gmsg <groupname> <message> or /msg <username> <message>.")
 
     except Exception as e:
         print(f"\n[Error]: Disconnected from server.")
