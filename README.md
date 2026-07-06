@@ -1,6 +1,4 @@
-# Stage 2: Unified Networked Chat Application Prototype
-
-**Team Members:** Kwazi Mbhokane, Siyabonga Ground, Isiphile Mkiwane
+# Unified Networked Chat Application 
 
 ## Project Overview
 This project is a multi-threaded, networked chat application that utilizes a hybrid Client-Server and Peer-to-Peer (P2P) architecture. It demonstrates reliable text-based communication over TCP and high-speed media transfers over connectionless UDP.
